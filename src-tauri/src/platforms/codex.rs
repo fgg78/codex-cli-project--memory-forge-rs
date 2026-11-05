@@ -2,8 +2,9 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
+use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior};
 use serde_json::{json, Value};
 
 use crate::database::{
@@ -18,6 +19,7 @@ use super::{
 };
 
 pub struct CodexPlatform {
+    codex_home: PathBuf,
     sessions_root: PathBuf,
     project_root: Option<PathBuf>,
 }
@@ -51,6 +53,7 @@ impl CodexPlatform {
     pub fn new(codex_home: PathBuf, project_root: Option<PathBuf>) -> Self {
         Self {
             sessions_root: codex_home.join("sessions"),
+            codex_home,
             project_root,
         }
     }
@@ -811,9 +814,15 @@ impl PlatformAdapter for CodexPlatform {
         let line_index: usize = parts[1]
             .parse()
             .map_err(|error| format!("Invalid line index: {error}"))?;
-        let mut rows = self.read_jsonl(path);
+        let original_raw = fs::read(path).map_err(|error| format!("Read error: {error}"))?;
+        let mut rows = String::from_utf8_lossy(&original_raw)
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .collect::<Vec<_>>();
+        let thread_id = self.thread_id(&rows, path);
 
-        let (old_content, role) = if parts.len() == 2 {
+        let (old_content, role, message_id) = if parts.len() == 2 {
             let Some(row) = rows.get_mut(line_index) else {
                 return Err("Line index out of range".to_string());
             };
@@ -833,7 +842,12 @@ impl PlatformAdapter for CodexPlatform {
                 .unwrap_or_default()
                 .to_string();
             payload["message"] = Value::String(new_content.to_string());
-            (old_content, role)
+            let message_id = payload
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            (old_content, role, message_id)
         } else {
             let content_index: usize = parts[2]
                 .parse()
@@ -853,6 +867,11 @@ impl PlatformAdapter for CodexPlatform {
 
             let role = payload
                 .get("role")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let message_id = payload
+                .get("id")
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string();
@@ -880,7 +899,15 @@ impl PlatformAdapter for CodexPlatform {
                 old
             };
 
-            (old_content, role)
+            (old_content, role, message_id)
+        };
+
+        let history_item_id = if role == "user" {
+            find_user_history_item_id(&rows, line_index, &old_content)
+        } else if role == "assistant" && !message_id.is_empty() {
+            Some(message_id.clone())
+        } else {
+            None
         };
 
         sync_mirrored_message(&mut rows, line_index, &role, &old_content, new_content);
@@ -893,6 +920,33 @@ impl PlatformAdapter for CodexPlatform {
 
         fs::write(path, format!("{}\n", serialized.join("\n")))
             .map_err(|error| format!("Write error: {error}"))?;
+
+        if let Some(history_item_id) = history_item_id {
+            match sync_history_projection(
+                &self.codex_home,
+                &thread_id,
+                &history_item_id,
+                &role,
+                &old_content,
+                new_content,
+            ) {
+                Ok(updated) => {
+                    eprintln!(
+                        "[codex] history projection sync thread={thread_id} item={history_item_id} databases_updated={updated}"
+                    );
+                }
+                Err(error) => {
+                    let restore_result = fs::write(path, &original_raw);
+                    let restore_note = restore_result
+                        .err()
+                        .map(|restore_error| format!("; JSONL rollback also failed: {restore_error}"))
+                        .unwrap_or_default();
+                    return Err(format!(
+                        "Codex history projection sync failed; JSONL edit was rolled back: {error}{restore_note}"
+                    ));
+                }
+            }
+        }
 
         Ok(old_content)
     }
@@ -1142,6 +1196,27 @@ fn sync_mirrored_message(
             continue;
         }
 
+        if row.get("type").and_then(Value::as_str) == Some("event_msg") {
+            let expected_type = match role {
+                "assistant" => "AgentMessage",
+                "user" => "UserMessage",
+                _ => continue,
+            };
+            let Some(item) = row
+                .get_mut("payload")
+                .and_then(|event| event.get_mut("item"))
+            else {
+                continue;
+            };
+            if item.get("type").and_then(Value::as_str) != Some(expected_type) {
+                continue;
+            }
+            if let Some(content) = item.get_mut("content") {
+                update_mirrored_response_content(content, old_content, new_content);
+            }
+            continue;
+        }
+
         let Some(payload) = row.get_mut("payload") else {
             continue;
         };
@@ -1185,6 +1260,252 @@ fn update_mirrored_response_content(content: &mut Value, old_content: &str, new_
             return;
         }
     }
+}
+
+fn find_user_history_item_id(rows: &[Value], message_line_index: usize, old_content: &str) -> Option<String> {
+    let payload = rows.get(message_line_index)?.get("payload")?;
+    let turn_id = payload
+        .get("internal_chat_message_metadata_passthrough")?
+        .get("turn_id")?
+        .as_str()?;
+    let mut matching_ids = rows.iter().filter_map(|row| {
+        let event = row.get("payload")?;
+        if row.get("type").and_then(Value::as_str) != Some("event_msg")
+            || event.get("turn_id").and_then(Value::as_str) != Some(turn_id)
+        {
+            return None;
+        }
+        let item = event.get("item")?;
+        if item.get("type").and_then(Value::as_str) != Some("UserMessage")
+            || !content_contains_text(item.get("content")?, old_content)
+        {
+            return None;
+        }
+        item.get("id").and_then(Value::as_str).map(str::to_string)
+    });
+    let id = matching_ids.next()?;
+    matching_ids.next().is_none().then_some(id)
+}
+
+fn content_contains_text(content: &Value, expected: &str) -> bool {
+    match content {
+        Value::String(text) => text == expected,
+        Value::Array(parts) => parts
+            .iter()
+            .any(|part| part.get("text").and_then(Value::as_str) == Some(expected)),
+        _ => false,
+    }
+}
+
+fn sync_history_projection(
+    codex_home: &Path,
+    thread_id: &str,
+    item_id: &str,
+    role: &str,
+    old_content: &str,
+    new_content: &str,
+) -> Result<usize, String> {
+    let entries = match fs::read_dir(codex_home) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(format!("cannot scan Codex home: {error}")),
+    };
+    let mut database_paths = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                return false;
+            };
+            let Some(version) = name
+                .strip_prefix("thread_history_")
+                .and_then(|name| name.strip_suffix(".sqlite"))
+            else {
+                return false;
+            };
+            !version.is_empty()
+                && version.chars().all(|character| character.is_ascii_digit())
+                && path.is_file()
+        })
+        .collect::<Vec<_>>();
+    database_paths.sort();
+
+    let mut matching_databases = Vec::new();
+    for database_path in database_paths {
+        let connection = Connection::open_with_flags(
+            &database_path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(|error| {
+            format!(
+                "cannot open Codex history database '{}': {error}",
+                database_path.display()
+            )
+        })?;
+        connection
+            .busy_timeout(Duration::from_secs(2))
+            .map_err(|error| format!("cannot configure Codex history database: {error}"))?;
+
+        let table_exists: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'thread_items')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| format!("cannot inspect Codex history schema: {error}"))?;
+        if !table_exists {
+            continue;
+        }
+
+        let mut statement = connection
+            .prepare("PRAGMA table_info(thread_items)")
+            .map_err(|error| format!("cannot inspect Codex thread_items columns: {error}"))?;
+        let columns = statement
+            .query_map([], |row| row.get::<_, String>(1))
+            .map_err(|error| format!("cannot inspect Codex thread_items columns: {error}"))?
+            .collect::<rusqlite::Result<HashSet<_>>>()
+            .map_err(|error| format!("cannot read Codex thread_items columns: {error}"))?;
+        drop(statement);
+        if !["thread_id", "item_id", "item_json"]
+            .into_iter()
+            .all(|column| columns.contains(column))
+        {
+            continue;
+        }
+
+        let matching_rows: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM thread_items WHERE thread_id = ?1 AND item_id = ?2",
+                [thread_id, item_id],
+                |row| row.get(0),
+            )
+            .map_err(|error| format!("cannot read Codex projected message: {error}"))?;
+        if matching_rows > 1 {
+            return Err(format!(
+                "Codex item '{item_id}' is duplicated in history database '{}'",
+                database_path.display()
+            ));
+        }
+        if matching_rows == 1 {
+            matching_databases.push(database_path);
+        }
+    }
+
+    if matching_databases.len() > 1 {
+        return Err(format!(
+            "Codex thread '{thread_id}' appears in multiple history databases"
+        ));
+    }
+    let Some(database_path) = matching_databases.pop() else {
+        return Ok(0);
+    };
+
+    let mut connection = Connection::open_with_flags(
+        &database_path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|error| {
+        format!(
+            "cannot open Codex history database '{}': {error}",
+            database_path.display()
+        )
+    })?;
+    connection
+        .busy_timeout(Duration::from_secs(2))
+        .map_err(|error| format!("cannot configure Codex history database: {error}"))?;
+
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|error| format!("cannot lock Codex history database: {error}"))?;
+    let item_json: String = transaction
+        .query_row(
+            "SELECT item_json FROM thread_items WHERE thread_id = ?1 AND item_id = ?2 LIMIT 1",
+            [thread_id, item_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| format!("cannot read Codex projected message: {error}"))?
+        .ok_or_else(|| format!("Codex projected item '{item_id}' disappeared during update"))?;
+
+    let mut item: Value = serde_json::from_str(&item_json)
+        .map_err(|error| format!("invalid Codex projected message JSON: {error}"))?;
+    let expected_type = match role {
+        "assistant" => "agentMessage",
+        "user" => "userMessage",
+        _ => return Ok(0),
+    };
+    if item.get("type").and_then(Value::as_str) != Some(expected_type) {
+        return Err(format!(
+            "Codex projected item '{item_id}' has unexpected type"
+        ));
+    }
+
+    let changed = match role {
+        "assistant" => {
+            let Some(text) = item.get("text").and_then(Value::as_str) else {
+                return Err(format!("Codex projected assistant item '{item_id}' has no text"));
+            };
+            if text == new_content {
+                false
+            } else if text == old_content {
+                item["text"] = Value::String(new_content.to_string());
+                true
+            } else {
+                return Err(format!(
+                    "Codex projected assistant item '{item_id}' no longer matches the edited text"
+                ));
+            }
+        }
+        "user" => {
+            let Some(content) = item.get_mut("content").and_then(Value::as_array_mut) else {
+                return Err(format!("Codex projected user item '{item_id}' has no content array"));
+            };
+            let mut found_old = false;
+            let mut found_new = false;
+            for part in content {
+                if part.get("text").and_then(Value::as_str) == Some(old_content) {
+                    part["text"] = Value::String(new_content.to_string());
+                    found_old = true;
+                    break;
+                }
+                found_new |= part.get("text").and_then(Value::as_str) == Some(new_content);
+            }
+            if found_old {
+                true
+            } else if found_new {
+                false
+            } else {
+                return Err(format!(
+                    "Codex projected user item '{item_id}' no longer matches the edited text"
+                ));
+            }
+        }
+        _ => return Ok(0),
+    };
+
+    if changed {
+        let updated_rows = transaction
+            .execute(
+                "UPDATE thread_items SET item_json = ?1 WHERE thread_id = ?2 AND item_id = ?3",
+                rusqlite::params![
+                    serde_json::to_string(&item)
+                        .map_err(|error| format!("cannot serialize projected message: {error}"))?,
+                    thread_id,
+                    item_id
+                ],
+            )
+            .map_err(|error| format!("cannot update Codex projected message: {error}"))?;
+        if updated_rows != 1 {
+            return Err(format!(
+                "expected to update one Codex projected item, updated {updated_rows}"
+            ));
+        }
+    }
+    transaction
+        .commit()
+        .map_err(|error| format!("cannot commit Codex history update: {error}"))?;
+
+    Ok(if changed { 1 } else { 0 })
 }
 
 fn encode_path_key(path: &Path) -> String {
@@ -1477,6 +1798,8 @@ mod tests {
         let rows = vec![
             json!({ "payload": { "type": "message", "role": "user", "content": [{ "type": "input_text", "text": "old request" }] } }),
             json!({ "payload": { "type": "user_message", "message": "old request" } }),
+            json!({ "payload": { "type": "message", "role": "assistant", "content": [{ "type": "output_text", "text": "old answer" }] } }),
+            json!({ "type": "event_msg", "payload": { "item": { "type": "AgentMessage", "content": [{ "type": "Text", "text": "old answer" }] } } }),
         ];
         fs::write(
             &path,
@@ -1498,8 +1821,6 @@ mod tests {
             .expect("update response item");
         let updated = platform.read_jsonl(&path);
 
-        fs::remove_dir_all(root).ok();
-
         assert_eq!(old, "old request");
         assert_eq!(
             updated[0]["payload"]["content"][0]["text"].as_str(),
@@ -1509,6 +1830,157 @@ mod tests {
             updated[1]["payload"]["message"].as_str(),
             Some("new request")
         );
+
+        let assistant_edit_target = format!("{}::2::0::text", path.to_string_lossy());
+        let old = platform
+            .update_message(&assistant_edit_target, "new answer")
+            .expect("update assistant response item");
+        let updated = platform.read_jsonl(&path);
+
+        assert_eq!(old, "old answer");
+        assert_eq!(
+            updated[2]["payload"]["content"][0]["text"].as_str(),
+            Some("new answer")
+        );
+        assert_eq!(
+            updated[3]["payload"]["item"]["content"][0]["text"].as_str(),
+            Some("new answer")
+        );
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn resolves_user_projection_id_from_turn_and_content() {
+        let rows = vec![
+            json!({
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "request"}],
+                    "internal_chat_message_metadata_passthrough": {"turn_id": "turn-1"}
+                }
+            }),
+            json!({
+                "type": "event_msg",
+                "payload": {
+                    "turn_id": "turn-1",
+                    "item": {
+                        "type": "UserMessage",
+                        "id": "projected-user-id",
+                        "content": [{"type": "Text", "text": "request"}]
+                    }
+                }
+            }),
+        ];
+
+        assert_eq!(
+            find_user_history_item_id(&rows, 0, "request").as_deref(),
+            Some("projected-user-id")
+        );
+    }
+
+    #[test]
+    fn sync_history_projection_updates_assistant_and_user_items() {
+        let root = std::env::var("MEMORY_FORGE_TEST_TMP")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| std::env::temp_dir())
+            .join(format!("codex-history-projection-{}", std::process::id()));
+        fs::create_dir_all(&root).expect("create test dir");
+        let db_path = root.join("thread_history_1.sqlite");
+        fs::write(root.join("thread_history_2.sqlite"), &[]).expect("create empty history file");
+        let connection = Connection::open(&db_path).expect("create history database");
+        connection
+            .execute_batch(
+                "CREATE TABLE thread_items (
+                    thread_id TEXT NOT NULL,
+                    turn_id TEXT NOT NULL,
+                    item_id TEXT NOT NULL,
+                    rollout_ordinal INTEGER NOT NULL,
+                    created_at_ms INTEGER NOT NULL,
+                    item_json TEXT NOT NULL,
+                    item_type TEXT NOT NULL DEFAULT '',
+                    updated_at_ordinal INTEGER NOT NULL DEFAULT 0,
+                    started_at_ms INTEGER,
+                    completed_at_ms INTEGER,
+                    PRIMARY KEY (thread_id, turn_id, item_id)
+                );",
+            )
+            .expect("create thread_items table");
+        connection
+            .execute(
+                "INSERT INTO thread_items (thread_id, turn_id, item_id, rollout_ordinal, created_at_ms, item_json) VALUES (?1, ?2, ?3, 1, 0, ?4)",
+                rusqlite::params![
+                    "thread-1",
+                    "turn-1",
+                    "assistant-1",
+                    json!({"type":"agentMessage","id":"assistant-1","text":"old answer"})
+                        .to_string()
+                ],
+            )
+            .expect("insert assistant projection");
+        connection
+            .execute(
+                "INSERT INTO thread_items (thread_id, turn_id, item_id, rollout_ordinal, created_at_ms, item_json) VALUES (?1, ?2, ?3, 2, 0, ?4)",
+                rusqlite::params![
+                    "thread-1",
+                    "turn-1",
+                    "user-1",
+                    json!({"type":"userMessage","id":"user-1","content":[{"type":"text","text":"old request"}]})
+                        .to_string()
+                ],
+            )
+            .expect("insert user projection");
+        drop(connection);
+
+        assert_eq!(
+            sync_history_projection(
+                &root,
+                "thread-1",
+                "assistant-1",
+                "assistant",
+                "old answer",
+                "new answer"
+            )
+            .expect("sync assistant projection"),
+            1
+        );
+        assert_eq!(
+            sync_history_projection(
+                &root,
+                "thread-1",
+                "user-1",
+                "user",
+                "old request",
+                "new request"
+            )
+            .expect("sync user projection"),
+            1
+        );
+
+        let connection = Connection::open(&db_path).expect("open history database");
+        let assistant: String = connection
+            .query_row(
+                "SELECT item_json FROM thread_items WHERE thread_id = ?1 AND item_id = ?2",
+                ("thread-1", "assistant-1"),
+                |row| row.get(0),
+            )
+            .expect("read assistant projection");
+        let user: String = connection
+            .query_row(
+                "SELECT item_json FROM thread_items WHERE thread_id = ?1 AND item_id = ?2",
+                ("thread-1", "user-1"),
+                |row| row.get(0),
+            )
+            .expect("read user projection");
+        assert_eq!(serde_json::from_str::<Value>(&assistant).unwrap()["text"], "new answer");
+        assert_eq!(
+            serde_json::from_str::<Value>(&user).unwrap()["content"][0]["text"],
+            "new request"
+        );
+
+        fs::remove_dir_all(root).ok();
     }
 
     #[test]
