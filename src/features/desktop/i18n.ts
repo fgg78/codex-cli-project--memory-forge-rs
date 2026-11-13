@@ -173,6 +173,7 @@ export type MessageKey =
   | "session.filter.all"
   | "session.filter.user"
   | "session.filter.assistant"
+  | "session.turnError"
   | "session.filter.thinking"
   | "session.totalMessages"
   | "session.export"
@@ -492,6 +493,7 @@ const messages: Record<LocaleId, Record<MessageKey, string>> = {
     "session.filter.all": "全部",
     "session.filter.user": "用户",
     "session.filter.assistant": "助手",
+    "session.turnError": "执行错误",
     "session.filter.thinking": "思考",
     "session.totalMessages": "共 {count} 条消息",
     "session.export": "导出",
@@ -809,6 +811,7 @@ const messages: Record<LocaleId, Record<MessageKey, string>> = {
     "session.filter.all": "All",
     "session.filter.user": "User",
     "session.filter.assistant": "Assistant",
+    "session.turnError": "Turn error",
     "session.filter.thinking": "Thinking",
     "session.totalMessages": "{count} messages",
     "session.export": "Export",

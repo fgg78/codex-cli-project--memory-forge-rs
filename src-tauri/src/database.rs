@@ -9,6 +9,14 @@ const MAX_INDEX_TEXT_BYTES: usize = 8 * 1024;
 const MAX_SESSION_INDEX_BYTES: usize = 256 * 1024;
 const SESSION_CONTENT_INDEX_VERSION: i64 = 2;
 
+fn content_index_version(platform: &str) -> i64 {
+    if platform == "codex" {
+        3
+    } else {
+        SESSION_CONTENT_INDEX_VERSION
+    }
+}
+
 const BUILTIN_PROMPT_FENJUE_CTF_NAME: &str = "焚诀·CTF 比赛";
 const BUILTIN_PROMPT_FENJUE_CTF_TAGS: &str = "代码,分析,CTF,焚诀";
 const BUILTIN_PROMPT_FENJUE_CTF_CONTENT: &str = r#"核心原则：
@@ -264,7 +272,7 @@ impl<'a> SessionContentIndex<'a> {
                 session_key,
                 fingerprint.file_size,
                 fingerprint.modified_at,
-                SESSION_CONTENT_INDEX_VERSION
+                content_index_version(platform)
             ],
             |row| row.get::<_, i64>(0),
         )
@@ -299,7 +307,7 @@ impl<'a> SessionContentIndex<'a> {
                     session_key,
                     fingerprint.file_size,
                     fingerprint.modified_at,
-                    SESSION_CONTENT_INDEX_VERSION
+                    content_index_version(platform)
                 ],
                 |row| row.get(0),
             )
@@ -364,7 +372,7 @@ impl<'a> SessionContentIndex<'a> {
             )
             .map_err(|e| format!("Prepare platform content search error: {e}"))?;
         let mut rows = stmt
-            .query(params![platform, needle, SESSION_CONTENT_INDEX_VERSION])
+            .query(params![platform, needle, content_index_version(platform)])
             .map_err(|e| format!("Query platform content search error: {e}"))?;
         let mut matches = HashMap::<String, IndexedSessionMatch>::new();
         while let Some(row) = rows
@@ -462,7 +470,7 @@ impl<'a> SessionContentIndex<'a> {
                 session_key,
                 fingerprint.file_size,
                 fingerprint.modified_at,
-                SESSION_CONTENT_INDEX_VERSION
+                content_index_version(platform)
             ],
         )
         .map_err(|e| format!("Upsert session content index metadata error: {e}"))?;

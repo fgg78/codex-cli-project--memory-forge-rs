@@ -819,7 +819,14 @@ pub fn session_edit_message(
         edit_target,
         &old_content,
         content,
-    )
+    )?;
+    if platform == "codex" {
+        let index = database::SessionContentIndex::new(&db.conn);
+        if !adapter.warm_content_index(session_key, Some(&index)) {
+            eprintln!("[codex] content index refresh pending for {session_key}");
+        }
+    }
+    Ok(())
 }
 
 const TOOL_EDIT_TARGET_PREFIX: &str = "tool-call::";

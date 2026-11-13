@@ -333,10 +333,19 @@ export function SessionDetail() {
     if (!await confirm({ title: t('session.erase'), description: t('session.eraseConfirm'), variant: 'danger' })) return
     try {
       await api.editMessage(currentPlatform, block.editTarget || block.id, '', sessionDetail.sessionKey)
-      const updatedBlocks = sessionDetail.blocks.map(b =>
-        (b.editTarget || b.id) === (block.editTarget || block.id) ? { ...b, content: '' } : b
-      )
-      dispatch({ type: 'setSessionDetail', payload: { ...sessionDetail, blocks: updatedBlocks } })
+      if (block.sourceMeta?.payloadType === 'task_complete') {
+        const [detail, logs] = await Promise.all([
+          api.getSessionDetail(currentPlatform, sessionDetail.sessionKey),
+          api.getEditLog(currentPlatform, sessionDetail.sessionKey),
+        ])
+        dispatch({ type: 'setSessionDetail', payload: detail })
+        dispatch({ type: 'setEditLog', payload: logs })
+      } else {
+        const updatedBlocks = sessionDetail.blocks.map(b =>
+          (b.editTarget || b.id) === (block.editTarget || block.id) ? { ...b, content: '' } : b
+        )
+        dispatch({ type: 'setSessionDetail', payload: { ...sessionDetail, blocks: updatedBlocks } })
+      }
       dispatch({ type: 'setSessionStatus', payload: { tone: 'success', message: t('session.messageSaved') } })
     } catch (err) {
       console.error('Failed to erase message:', err)
@@ -602,7 +611,9 @@ export function SessionDetail() {
       const hasToolCalls = includeToolCallsInExport && toolCalls.length > 0
       if (!hasContent && !hasToolCalls) continue
 
-      const roleLabel = block.role === 'user' ? 'User' : block.role === 'assistant' ? 'Assistant' : 'Thinking'
+      const roleLabel = block.sourceMeta?.payloadType === 'task_complete'
+        ? 'Turn error'
+        : block.role === 'user' ? 'User' : block.role === 'assistant' ? 'Assistant' : 'Thinking'
       const headingLabel = !hasContent && hasToolCalls && block.role === 'assistant'
         ? 'Assistant Tool Calls'
         : roleLabel
@@ -1430,14 +1441,7 @@ function ToolCallsConsole({ toolCalls, canErase, eraseLabel, erasingToolCallId, 
 }
 
 const MessageBlock = forwardRef<HTMLDivElement, {
-  block: {
-    role: string
-    content: string
-    id: string
-    editTarget?: string
-    editable?: boolean
-    toolCalls?: ToolCallBlock[]
-  }
+  block: TimelineBlock
   index: number
   onEdit: () => void
   onErase: () => void
@@ -1480,7 +1484,16 @@ const MessageBlock = forwardRef<HTMLDivElement, {
       badgeClass: 'bg-amber-500/15 text-amber-400 border-amber-500/30'
     },
   }
-  const config = roleConfig[block.role as keyof typeof roleConfig] || roleConfig.assistant
+  const isTurnError = block.sourceMeta?.payloadType === 'task_complete'
+  const config = isTurnError ? {
+    ...roleConfig.assistant,
+    label: t('session.turnError'),
+    icon: X,
+    bgGradient: 'from-rose-500/8 via-rose-500/2 to-transparent',
+    borderColor: 'border-l-rose-500/60',
+    iconBg: 'bg-rose-500/20 text-rose-400',
+    badgeClass: 'bg-rose-500/15 text-rose-400 border-rose-500/30',
+  } : (roleConfig[block.role as keyof typeof roleConfig] || roleConfig.assistant)
   const Icon = config.icon
   const isKiroExecutionPlaceholder = block.role === 'assistant'
     && block.content.trim() === 'On it.'

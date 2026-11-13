@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
-use std::fs::{self, File};
-use std::io::{BufRead, BufReader};
+use std::fs::{self, File, OpenOptions};
+use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -271,6 +271,25 @@ impl CodexPlatform {
                 .and_then(Value::as_str)
                 .unwrap_or_default()
             {
+                "task_complete" if line.get("type").and_then(Value::as_str) == Some("event_msg") => {
+                    if let Some(content) = codex_task_error_message(payload) {
+                        let block = TimelineBlock {
+                            id: format!("{line_index}:task_error"),
+                            role: "assistant".to_string(),
+                            content: content.to_string(),
+                            editable: true,
+                            edit_target: format!("{file_key}::{line_index}::task_error"),
+                            source_meta: json!({
+                                "lineIndex": line_index,
+                                "payloadType": "task_complete",
+                                "errorCode": payload.get("error")
+                                    .and_then(|error| error.get("codex_error_info")),
+                            }),
+                            tool_calls: Vec::new(),
+                        };
+                        push_codex_block(&mut blocks, &mut pending_tool_calls, block);
+                    }
+                }
                 "message" => {
                     if let Some(role) = codex_message_role(payload) {
                         for part in codex_message_text_parts(payload) {
@@ -405,6 +424,20 @@ impl CodexPlatform {
                     return true;
                 };
                 let msg_type = payload.get("type").and_then(Value::as_str).unwrap_or("");
+                if msg_type == "task_complete"
+                    && line.get("type").and_then(Value::as_str) == Some("event_msg")
+                {
+                    if let Some(message) = codex_task_error_message(payload) {
+                        let entry = SessionContentEntry::joined_text(
+                            msg_index,
+                            "assistant",
+                            vec![message.to_string()],
+                        );
+                        msg_index += 1;
+                        return push_bounded_index_entry(&mut entries, &mut indexed_bytes, entry);
+                    }
+                    return true;
+                }
                 let role = match msg_type {
                     "message" => match codex_message_role(payload) {
                         Some(role) => role,
@@ -806,7 +839,7 @@ impl PlatformAdapter for CodexPlatform {
 
     fn update_message(&self, edit_target: &str, new_content: &str) -> Result<String, String> {
         let parts: Vec<&str> = edit_target.split("::").collect();
-        if parts.len() != 2 && parts.len() != 4 {
+        if parts.len() != 2 && parts.len() != 4 && (parts.len() != 3 || parts[2] != "task_error") {
             return Err(format!("Invalid edit target: {edit_target}"));
         }
 
@@ -822,7 +855,40 @@ impl PlatformAdapter for CodexPlatform {
             .collect::<Vec<_>>();
         let thread_id = self.thread_id(&rows, path);
 
-        let (old_content, role, message_id) = if parts.len() == 2 {
+        let (old_content, role, message_id, error_turn_id) = if parts.len() == 3 {
+            let Some(row) = rows.get_mut(line_index) else {
+                return Err("Line index out of range".to_string());
+            };
+            if row.get("type").and_then(Value::as_str) != Some("event_msg") {
+                return Err("Edit target does not point to a Codex turn error".to_string());
+            }
+            let Some(payload) = row.get_mut("payload") else {
+                return Err("Missing payload".to_string());
+            };
+            if payload.get("type").and_then(Value::as_str) != Some("task_complete") {
+                return Err("Edit target does not point to a Codex turn error".to_string());
+            }
+            let turn_id = payload
+                .get("turn_id")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+                .ok_or("Missing Codex turn ID")?
+                .to_string();
+            let old_content = match payload.get("error") {
+                Some(Value::Null) => String::new(),
+                Some(error) => error.get("message").and_then(Value::as_str)
+                    .ok_or("Missing Codex turn error message")?.to_string(),
+                None => return Err("Missing Codex turn error".to_string()),
+            };
+            if new_content.is_empty() {
+                payload["error"] = Value::Null;
+            } else if payload["error"].is_null() {
+                payload["error"] = json!({ "message": new_content });
+            } else {
+                payload["error"]["message"] = Value::String(new_content.to_string());
+            }
+            (old_content, "task_error".to_string(), String::new(), Some(turn_id))
+        } else if parts.len() == 2 {
             let Some(row) = rows.get_mut(line_index) else {
                 return Err("Line index out of range".to_string());
             };
@@ -847,7 +913,7 @@ impl PlatformAdapter for CodexPlatform {
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string();
-            (old_content, role, message_id)
+            (old_content, role, message_id, None)
         } else {
             let content_index: usize = parts[2]
                 .parse()
@@ -899,7 +965,7 @@ impl PlatformAdapter for CodexPlatform {
                 old
             };
 
-            (old_content, role, message_id)
+            (old_content, role, message_id, None)
         };
 
         let history_item_id = if role == "user" {
@@ -910,16 +976,49 @@ impl PlatformAdapter for CodexPlatform {
             None
         };
 
-        sync_mirrored_message(&mut rows, line_index, &role, &old_content, new_content);
+        if error_turn_id.is_none() {
+            sync_mirrored_message(&mut rows, line_index, &role, &old_content, new_content);
+        }
 
-        let serialized = rows
-            .iter()
-            .map(serde_json::to_string)
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| format!("Serialize error: {error}"))?;
-
-        fs::write(path, format!("{}\n", serialized.join("\n")))
-            .map_err(|error| format!("Write error: {error}"))?;
+        let mut in_place_patch = None;
+        let updated_raw = if error_turn_id.is_some() {
+            let mut updated = serde_json::to_string(&rows[line_index])
+                .map_err(|error| format!("Serialize error: {error}"))?;
+            let raw_lines = original_raw.split_inclusive(|byte| *byte == b'\n').collect::<Vec<_>>();
+            let original_line = raw_lines.get(line_index).ok_or("Codex rollout line disappeared")?;
+            let suffix_len = if original_line.ends_with(b"\r\n") { 2 } else if original_line.ends_with(b"\n") { 1 } else { 0 };
+            if updated.len() <= original_line.len() - suffix_len {
+                updated.push_str(&" ".repeat(original_line.len() - suffix_len - updated.len()));
+                in_place_patch = Some((
+                    raw_lines[..line_index].iter().map(|line| line.len()).sum::<usize>() as u64,
+                    original_line.to_vec(),
+                ));
+            }
+            rewrite_jsonl_row(&original_raw, line_index, rows.len(), &updated)?
+        } else {
+            let serialized = rows
+                .iter()
+                .map(serde_json::to_string)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| format!("Serialize error: {error}"))?;
+            format!("{}\n", serialized.join("\n")).into_bytes()
+        };
+        if error_turn_id.is_some() && fs::read(path).map_err(|error| format!("Read error: {error}"))? != original_raw {
+            return Err("Codex rollout changed during edit".to_string());
+        }
+        if error_turn_id.is_some() && in_place_patch.is_none() && codex_rollout_has_writer(path) {
+            return Err("Codex is writing this session; close it before a length-changing error edit".to_string());
+        }
+        if let Some((offset, original_line)) = &in_place_patch {
+            let updated_line = &updated_raw[*offset as usize..*offset as usize + original_line.len()];
+            if let Err(error) = write_jsonl_line(path, *offset, updated_line) {
+                let _ = rollback_jsonl(path, &original_raw, &in_place_patch);
+                return Err(format!("Write error: {error}"));
+            }
+        } else {
+            fs::write(path, &updated_raw)
+                .map_err(|error| format!("Write error: {error}"))?;
+        }
 
         if let Some(history_item_id) = history_item_id {
             match sync_history_projection(
@@ -936,7 +1035,7 @@ impl PlatformAdapter for CodexPlatform {
                     );
                 }
                 Err(error) => {
-                    let restore_result = fs::write(path, &original_raw);
+                    let restore_result = rollback_jsonl(path, &original_raw, &in_place_patch);
                     let restore_note = restore_result
                         .err()
                         .map(|restore_error| format!("; JSONL rollback also failed: {restore_error}"))
@@ -945,6 +1044,25 @@ impl PlatformAdapter for CodexPlatform {
                         "Codex history projection sync failed; JSONL edit was rolled back: {error}{restore_note}"
                     ));
                 }
+            }
+        }
+
+        if let Some(turn_id) = error_turn_id {
+            if let Err(error) = sync_turn_error_projection(
+                &self.codex_home,
+                &thread_id,
+                &turn_id,
+                &old_content,
+                new_content,
+                &jsonl_line_offsets(&updated_raw),
+            ) {
+                let restore_note = rollback_jsonl(path, &original_raw, &in_place_patch)
+                    .err()
+                    .map(|restore_error| format!("; JSONL rollback also failed: {restore_error}"))
+                    .unwrap_or_default();
+                return Err(format!(
+                    "Codex turn error sync failed; JSONL edit was rolled back: {error}{restore_note}"
+                ));
             }
         }
 
@@ -1095,6 +1213,14 @@ fn codex_message_text_parts(payload: &Value) -> Vec<CodexTextPart> {
             })
         })
         .collect()
+}
+
+fn codex_task_error_message(payload: &Value) -> Option<&str> {
+    payload
+        .get("error")?
+        .get("message")?
+        .as_str()
+        .filter(|message| !message.trim().is_empty())
 }
 
 fn should_include_response_message(role: &str, text: &str) -> bool {
@@ -1297,17 +1423,88 @@ fn content_contains_text(content: &Value, expected: &str) -> bool {
     }
 }
 
-fn sync_history_projection(
-    codex_home: &Path,
-    thread_id: &str,
-    item_id: &str,
-    role: &str,
-    old_content: &str,
-    new_content: &str,
-) -> Result<usize, String> {
+fn write_jsonl_line(path: &Path, offset: u64, line: &[u8]) -> std::io::Result<()> {
+    let mut file = OpenOptions::new().write(true).open(path)?;
+    file.seek(SeekFrom::Start(offset))?;
+    file.write_all(line)?;
+    file.sync_data()
+}
+
+fn rollback_jsonl(path: &Path, original: &[u8], patch: &Option<(u64, Vec<u8>)>) -> std::io::Result<()> {
+    if let Some((offset, line)) = patch {
+        write_jsonl_line(path, *offset, line)
+    } else {
+        fs::write(path, original)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn codex_rollout_has_writer(path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    let Ok(target) = fs::metadata(path) else { return true };
+    let Ok(processes) = fs::read_dir("/proc") else { return true };
+    for process in processes.flatten() {
+        if !process.file_name().to_string_lossy().bytes().all(|byte| byte.is_ascii_digit()) {
+            continue;
+        }
+        let Ok(descriptors) = fs::read_dir(process.path().join("fd")) else { continue };
+        for descriptor in descriptors.flatten() {
+            let Ok(file) = fs::metadata(descriptor.path()) else { continue };
+            if file.dev() != target.dev() || file.ino() != target.ino() {
+                continue;
+            }
+            let Ok(info) = fs::read_to_string(process.path().join("fdinfo").join(descriptor.file_name())) else { continue };
+            let flags = info.lines().find_map(|line| line.strip_prefix("flags:")?.trim().split_whitespace().next())
+                .and_then(|value| u32::from_str_radix(value, 8).ok());
+            if flags.is_some_and(|flags| flags & 3 != 0) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+#[cfg(not(target_os = "linux"))]
+fn codex_rollout_has_writer(_path: &Path) -> bool {
+    false
+}
+
+fn rewrite_jsonl_row(raw: &[u8], target_index: usize, expected_rows: usize, updated: &str) -> Result<Vec<u8>, String> {
+    let lines = raw.split_inclusive(|byte| *byte == b'\n').collect::<Vec<_>>();
+    if lines.len() != expected_rows || lines.iter().any(|line| {
+        serde_json::from_slice::<Value>(line).is_err()
+    }) {
+        return Err("Codex rollout contains blank or invalid rows; edit aborted".to_string());
+    }
+    let mut result = Vec::with_capacity(raw.len() + updated.len());
+    for (index, line) in lines.into_iter().enumerate() {
+        if index == target_index {
+            result.extend_from_slice(updated.as_bytes());
+            if line.ends_with(b"\r\n") {
+                result.extend_from_slice(b"\r\n");
+            } else if line.ends_with(b"\n") {
+                result.push(b'\n');
+            }
+        } else {
+            result.extend_from_slice(line);
+        }
+    }
+    Ok(result)
+}
+
+fn jsonl_line_offsets(raw: &[u8]) -> Vec<i64> {
+    let mut offsets = vec![0];
+    for line in raw.split_inclusive(|byte| *byte == b'\n') {
+        offsets.push(offsets.last().copied().unwrap_or(0) + line.len() as i64);
+    }
+    offsets
+}
+
+fn history_database_paths(codex_home: &Path) -> Result<Vec<PathBuf>, String> {
     let entries = match fs::read_dir(codex_home) {
         Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => return Err(format!("cannot scan Codex home: {error}")),
     };
     let mut database_paths = entries
@@ -1329,6 +1526,133 @@ fn sync_history_projection(
         })
         .collect::<Vec<_>>();
     database_paths.sort();
+    Ok(database_paths)
+}
+
+fn sync_turn_error_projection(
+    codex_home: &Path,
+    thread_id: &str,
+    turn_id: &str,
+    old_content: &str,
+    new_content: &str,
+    offsets: &[i64],
+) -> Result<usize, String> {
+    let mut matching_databases = Vec::new();
+    for database_path in history_database_paths(codex_home)? {
+        let connection = Connection::open_with_flags(&database_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(|error| format!("cannot open Codex history database '{}': {error}", database_path.display()))?;
+        connection.busy_timeout(Duration::from_secs(2))
+            .map_err(|error| format!("cannot configure Codex history database: {error}"))?;
+        let table_exists: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'thread_turns')",
+            [],
+            |row| row.get(0),
+        ).map_err(|error| format!("cannot inspect Codex history schema: {error}"))?;
+        if !table_exists {
+            continue;
+        }
+        let count: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM thread_turns WHERE thread_id = ?1 AND turn_id = ?2",
+            [thread_id, turn_id],
+            |row| row.get(0),
+        ).map_err(|error| format!("cannot read Codex turn error: {error}"))?;
+        if count > 1 {
+            return Err(format!("Codex turn '{turn_id}' is duplicated in '{}'", database_path.display()));
+        }
+        if count == 1 {
+            matching_databases.push(database_path);
+        }
+    }
+    if matching_databases.len() > 1 {
+        return Err(format!("Codex turn '{turn_id}' appears in multiple history databases"));
+    }
+    let Some(database_path) = matching_databases.pop() else {
+        return Ok(0);
+    };
+
+    let mut connection = Connection::open_with_flags(&database_path, OpenFlags::SQLITE_OPEN_READ_WRITE)
+        .map_err(|error| format!("cannot open Codex history database '{}': {error}", database_path.display()))?;
+    connection.busy_timeout(Duration::from_secs(2))
+        .map_err(|error| format!("cannot configure Codex history database: {error}"))?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|error| format!("cannot lock Codex history database: {error}"))?;
+    let (error_json, status): (Option<String>, String) = transaction.query_row(
+        "SELECT error_json, status FROM thread_turns WHERE thread_id = ?1 AND turn_id = ?2",
+        [thread_id, turn_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    ).optional()
+        .map_err(|error| format!("cannot read Codex turn error: {error}"))?
+        .ok_or_else(|| format!("Codex turn '{turn_id}' disappeared during update"))?;
+    let mut error = error_json.as_deref()
+        .map(serde_json::from_str::<Value>)
+        .transpose().map_err(|error| format!("invalid Codex turn error JSON: {error}"))?
+        .unwrap_or_else(|| json!({ "message": "" }));
+    let current = error.get("message").and_then(Value::as_str)
+        .ok_or("Codex turn error has no message")?;
+    if current != old_content && current != new_content {
+        return Err(format!("Codex turn '{turn_id}' error no longer matches the edited text"));
+    }
+    let new_status = if new_content.is_empty() { "completed" } else { "failed" };
+    let new_error_json = if new_content.is_empty() {
+        None
+    } else {
+        error["message"] = Value::String(new_content.to_string());
+        Some(error.to_string())
+    };
+    let changed = error_json != new_error_json || status != new_status;
+    if changed {
+        let updated = transaction.execute(
+            "UPDATE thread_turns SET error_json = ?1, status = ?2 WHERE thread_id = ?3 AND turn_id = ?4",
+            rusqlite::params![new_error_json, new_status, thread_id, turn_id],
+        ).map_err(|error| format!("cannot update Codex turn error: {error}"))?;
+        if updated != 1 {
+            return Err(format!("expected to update one Codex turn, updated {updated}"));
+        }
+    }
+    let mut turns = transaction.prepare(
+        "SELECT turn_id, rollout_ordinal, rollout_end_ordinal FROM thread_turns WHERE thread_id = ?1"
+    ).map_err(|error| format!("cannot inspect Codex rollout offsets: {error}"))?;
+    let turn_offsets = turns.query_map([thread_id], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, Option<usize>>(1)?, row.get::<_, Option<usize>>(2)?))
+    }).map_err(|error| format!("cannot read Codex rollout offsets: {error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("cannot read Codex rollout offsets: {error}"))?;
+    drop(turns);
+    for (id, start, end) in turn_offsets {
+        let (Some(start), Some(end)) = (start, end) else { continue };
+        let (Some(&start_offset), Some(&end_offset)) = (offsets.get(start), offsets.get(end + 1)) else {
+            return Err(format!("Codex rollout offsets out of range for turn '{id}'"));
+        };
+        transaction.execute(
+            "UPDATE thread_turns SET rollout_byte_offset = ?1, rollout_end_byte_offset = ?2 WHERE thread_id = ?3 AND turn_id = ?4",
+            rusqlite::params![start_offset, end_offset, thread_id, id],
+        ).map_err(|error| format!("cannot update Codex rollout offsets: {error}"))?;
+    }
+    let next_ordinal: Option<usize> = transaction.query_row(
+        "SELECT next_rollout_ordinal FROM thread_history_projection_state WHERE thread_id = ?1",
+        [thread_id], |row| row.get(0),
+    ).optional().map_err(|error| format!("cannot read Codex projection state: {error}"))?;
+    if let Some(next_ordinal) = next_ordinal {
+        let next_offset = offsets.get(next_ordinal)
+            .ok_or("Codex projection ordinal exceeds rollout length")?;
+        transaction.execute(
+            "UPDATE thread_history_projection_state SET next_rollout_byte_offset = ?1 WHERE thread_id = ?2",
+            rusqlite::params![next_offset, thread_id],
+        ).map_err(|error| format!("cannot update Codex projection state: {error}"))?;
+    }
+    transaction.commit().map_err(|error| format!("cannot commit Codex turn error update: {error}"))?;
+    Ok(usize::from(changed))
+}
+
+fn sync_history_projection(
+    codex_home: &Path,
+    thread_id: &str,
+    item_id: &str,
+    role: &str,
+    old_content: &str,
+    new_content: &str,
+) -> Result<usize, String> {
+    let database_paths = history_database_paths(codex_home)?;
 
     let mut matching_databases = Vec::new();
     for database_path in database_paths {
@@ -1648,6 +1972,221 @@ fn normalize_path_for_prefix(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn task_complete_error_is_displayed_and_indexed_without_editing_the_rollout() {
+        let root = std::env::temp_dir().join(format!(
+            "memory-forge-codex-task-error-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::create_dir_all(&root).expect("create temp dir");
+        let path = root.join("session.jsonl");
+        let lines = vec![
+            json!({ "type": "event_msg", "payload": { "type": "user_message", "message": "inspect the result" } }),
+            json!({ "type": "event_msg", "payload": { "type": "task_complete", "error": null } }),
+            json!({ "type": "event_msg", "timestamp": "2026-11-13T10:25:49.858Z", "payload": {
+                "type": "task_complete", "last_agent_message": null,
+                "error": { "message": "This content was flagged for possible cybersecurity risk.", "codex_error_info": "cyber_policy" }
+            } }),
+        ];
+        fs::write(
+            &path,
+            lines.iter().map(Value::to_string).collect::<Vec<_>>().join("\n") + "\n",
+        ).expect("write session");
+
+        let platform = CodexPlatform::new(root.clone(), None);
+        let detail = platform.get_session_detail(path.to_str().unwrap(), &HashMap::new())
+            .expect("read detail");
+        assert_eq!(detail.blocks.len(), 2);
+        let error = &detail.blocks[1];
+        assert_eq!(error.content, "This content was flagged for possible cybersecurity risk.");
+        assert_eq!(error.role, "assistant");
+        assert!(error.editable);
+        assert_eq!(error.edit_target, format!("{}::2::task_error", path.display()));
+        assert_eq!(error.source_meta["payloadType"], "task_complete");
+        assert_eq!(error.source_meta["errorCode"], "cyber_policy");
+        assert_eq!(error.source_meta["createdAt"], "2026-11-13T10:25:49.858Z");
+        let matches = platform.content_search(path.to_str().unwrap(), "cybersecurity risk");
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].role, "assistant");
+
+        let conn = Connection::open_in_memory().expect("open sqlite");
+        crate::database::init_tables(&conn).expect("init sqlite");
+        let conn = std::sync::Mutex::new(conn);
+        let index = SessionContentIndex::new(&conn);
+        let key = path.to_str().unwrap();
+        let fingerprint = SessionSummaryCache::fingerprint(&path).expect("file fingerprint");
+        {
+            let conn = conn.lock().expect("db lock");
+            conn.execute(
+                "INSERT INTO session_content_index_meta
+                    (platform, session_key, file_size, modified_at, schema_version)
+                 VALUES (?1, ?2, ?3, ?4, 2)",
+                rusqlite::params!["codex", key, fingerprint.file_size, fingerprint.modified_at],
+            ).expect("insert old index metadata");
+        }
+        assert!(!platform.has_current_content_index(key, Some(&index)));
+        assert!(platform.warm_content_index(key, Some(&index)));
+        assert!(platform.has_current_content_index(key, Some(&index)));
+        assert_eq!(platform.content_search_with_index(key, "cybersecurity risk", Some(&index)).len(), 1);
+        assert!(index.search_platform("codex", "cybersecurity risk", 5).unwrap().contains_key(key));
+        drop(index);
+        drop(conn);
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn turn_error_edit_erase_and_restore_sync_jsonl_both_databases_and_search() {
+        let root = std::env::temp_dir().join(format!(
+            "memory-forge-codex-turn-edit-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let codex_home = root.join("codex-home");
+        let session_dir = codex_home.join("sessions");
+        fs::create_dir_all(&session_dir).expect("create sessions");
+        let path = session_dir.join("rollout.jsonl");
+        let rows = [
+            json!({"type":"session_meta","payload":{"id":"thread-1"}}),
+            json!({"type":"event_msg","payload":{"type":"user_message","message":"hello"}}),
+            json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1",
+                "error":{"message":"original failure","codex_error_info":"cyber_policy"}}}),
+        ];
+        fs::write(&path, rows.iter().map(Value::to_string).collect::<Vec<_>>().join("\n") + "\n")
+            .expect("write rollout");
+        let initial_file_size = fs::metadata(&path).unwrap().len();
+        let history_path = codex_home.join("thread_history_1.sqlite");
+        let history = Connection::open(&history_path).expect("create Codex history");
+        history.execute_batch(
+            "CREATE TABLE thread_turns (
+                 thread_id TEXT NOT NULL, turn_id TEXT NOT NULL, error_json TEXT,
+                 status TEXT NOT NULL, rollout_ordinal INTEGER NOT NULL,
+                 rollout_end_ordinal INTEGER, rollout_byte_offset INTEGER,
+                 rollout_end_byte_offset INTEGER, PRIMARY KEY (thread_id, turn_id));
+             CREATE TABLE thread_history_projection_state (
+                 thread_id TEXT PRIMARY KEY, next_rollout_ordinal INTEGER NOT NULL,
+                 next_rollout_byte_offset INTEGER NOT NULL);",
+        ).expect("create history table");
+        history.execute(
+            "INSERT INTO thread_turns
+                (thread_id, turn_id, error_json, status, rollout_ordinal, rollout_end_ordinal)
+             VALUES (?1, ?2, ?3, 'failed', 1, 2)",
+            rusqlite::params!["thread-1", "turn-1", json!({
+                "message":"original failure", "codexErrorInfo":"cyberPolicy"
+            }).to_string()],
+        ).expect("insert history turn");
+        history.execute(
+            "INSERT INTO thread_history_projection_state VALUES (?1, 3, 999999)",
+            ["thread-1"],
+        ).expect("insert stale projection state");
+        drop(history);
+
+        let db = crate::database::DbState::new(root.join("memory-forge.db").to_str().unwrap())
+            .expect("open forge database");
+        crate::database::init_tables(&db.conn.lock().unwrap()).expect("init forge database");
+        let settings = crate::settings::AppSettings {
+            codex_home: Some(codex_home.to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        let platform = CodexPlatform::new(codex_home, None);
+        let key = path.to_str().unwrap();
+        let edit_target = format!("{key}::2::task_error");
+
+        let invalid_target = format!("{key}::1::task_error");
+        assert!(platform.update_message(&invalid_target, "bad").is_err());
+        #[cfg(target_os = "linux")]
+        {
+            let writer = OpenOptions::new().write(true).open(&path).unwrap();
+            assert!(platform.update_message(&edit_target, &"long error ".repeat(30))
+                .unwrap_err().contains("Codex is writing"));
+            drop(writer);
+            assert_eq!(fs::metadata(&path).unwrap().len(), initial_file_size);
+        }
+        crate::session_service::session_edit_message(
+            &db, &settings, "codex", &edit_target, "edited failure", key,
+        ).expect("edit turn error");
+        assert_eq!(platform.read_jsonl(&path)[2]["payload"]["error"]["message"], "edited failure");
+        let history = Connection::open(&history_path).unwrap();
+        let projected: String = history.query_row(
+            "SELECT error_json FROM thread_turns WHERE thread_id = ?1 AND turn_id = ?2",
+            ["thread-1", "turn-1"], |row| row.get(0),
+        ).unwrap();
+        let projected: Value = serde_json::from_str(&projected).unwrap();
+        assert_eq!(projected["message"], "edited failure");
+        assert_eq!(projected["codexErrorInfo"], "cyberPolicy");
+        let index = SessionContentIndex::new(&db.conn);
+        assert!(index.search_platform("codex", "edited failure", 5).unwrap().contains_key(key));
+        assert!(!index.search_platform("codex", "original failure", 5).unwrap().contains_key(key));
+
+        crate::session_service::session_edit_message(
+            &db, &settings, "codex", &edit_target, "", key,
+        ).expect("erase turn error");
+        assert_eq!(fs::metadata(&path).unwrap().len(), initial_file_size);
+        assert_eq!(platform.get_session_detail(key, &HashMap::new()).unwrap().blocks.len(), 1);
+        assert!(platform.read_jsonl(&path)[2]["payload"]["error"].is_null());
+        let erased: (Option<String>, String, i64) = history.query_row(
+            "SELECT error_json, status, rollout_end_byte_offset FROM thread_turns WHERE thread_id = ?1 AND turn_id = ?2",
+            ["thread-1", "turn-1"], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).unwrap();
+        assert_eq!((erased.0, erased.1.as_str()), (None, "completed"));
+        assert_eq!(erased.2, fs::metadata(&path).unwrap().len() as i64);
+        let projection_offset: i64 = history.query_row(
+            "SELECT next_rollout_byte_offset FROM thread_history_projection_state WHERE thread_id = ?1",
+            ["thread-1"], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(projection_offset, erased.2);
+        assert!(!index.search_platform("codex", "edited failure", 5).unwrap().contains_key(key));
+        let logs = crate::database::get_edit_log(&db.conn, "codex", key).unwrap();
+        assert_eq!(logs.len(), 2);
+        let erase_id = logs.iter().find(|log| log.new_content.is_empty()).unwrap().id;
+        crate::session_service::session_restore_message(&db, &settings, "codex", erase_id, key)
+            .expect("restore erased turn error");
+        assert_eq!(fs::metadata(&path).unwrap().len(), initial_file_size);
+        assert_eq!(platform.get_session_detail(key, &HashMap::new()).unwrap().blocks[1].content, "edited failure");
+        let projected: String = history.query_row(
+            "SELECT error_json FROM thread_turns WHERE thread_id = ?1 AND turn_id = ?2",
+            ["thread-1", "turn-1"], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(serde_json::from_str::<Value>(&projected).unwrap()["message"], "edited failure");
+        let restored_status: String = history.query_row(
+            "SELECT status FROM thread_turns WHERE thread_id = ?1 AND turn_id = ?2",
+            ["thread-1", "turn-1"], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(restored_status, "failed");
+        assert!(index.search_platform("codex", "edited failure", 5).unwrap().contains_key(key));
+        drop(history);
+        drop(index);
+        drop(db);
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn turn_error_edit_rolls_back_jsonl_if_history_message_has_changed() {
+        let root = std::env::temp_dir().join(format!(
+            "memory-forge-codex-turn-mismatch-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("rollout.jsonl");
+        let original = [
+            json!({"payload":{"id":"thread-1"}}),
+            json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1",
+                "error":{"message":"old failure"}}}),
+        ].iter().map(Value::to_string).collect::<Vec<_>>().join("\n") + "\n";
+        fs::write(&path, &original).unwrap();
+        let history = Connection::open(root.join("thread_history_1.sqlite")).unwrap();
+        history.execute_batch("CREATE TABLE thread_turns (thread_id TEXT, turn_id TEXT, error_json TEXT);
+            INSERT INTO thread_turns VALUES ('thread-1', 'turn-1', '{\"message\":\"different failure\"}');")
+            .unwrap();
+        drop(history);
+        let platform = CodexPlatform::new(root.clone(), None);
+        let target = format!("{}::1::task_error", path.display());
+        assert!(platform.update_message(&target, "replacement").is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+        fs::remove_dir_all(root).ok();
+    }
 
     #[test]
     fn parses_top_level_subagent_metadata_and_legacy_role_alias() {
